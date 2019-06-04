@@ -47,6 +47,11 @@ from labscript_utils import check_version
 # the same Qt library and API version, and therefore not conflict with any
 # other code is using:
 check_version('qtutils', '2.0.0', '3.0.0')
+
+# Required version for dedent() function
+check_version('labscript_utils', '2.8.0', '3.0.0')
+from labscript_utils import dedent
+
 from pylab import *
 
 import labscript.functions as functions
@@ -494,7 +499,7 @@ class _RemoteConnection(Device):
         
         
 class RemoteBLACS(_RemoteConnection):
-    def __init__(self, name, host, port=7340, parent=None):
+    def __init__(self, name, host, port=7341, parent=None):
         _RemoteConnection.__init__(self, name, parent, "%s:%s"%(host, port))
         
         
@@ -906,9 +911,10 @@ class Pseudoclock(Device):
 
 class TriggerableDevice(Device):
     trigger_edge_type = 'rising'
+    minimum_recovery_time = 0
     # A class devices should inherit if they do
     # not require a pseudoclock, but do require a trigger.
-    # This enables them to have a Trigger divice as a parent
+    # This enables them to have a Trigger device as a parent
     
     @set_passed_properties(property_names = {})
     def __init__(self, name, parent_device, connection, parentless=False, **kwargs):
@@ -927,8 +933,66 @@ class TriggerableDevice(Device):
             parent_device = self.trigger_device
             connection = 'trigger'
             
+        self.__triggers = []
         Device.__init__(self, name, parent_device, connection, **kwargs)
-    
+
+    def trigger(self, t, duration):
+        """Request parent trigger device to produce a trigger at time t with given
+        duration."""
+        # Only ask for a trigger if one has not already been requested by another device
+        # attached to the same trigger:
+        already_requested = False
+        for other_device in self.trigger_device.child_devices:
+            if other_device is not self:
+                for other_t, other_duration in other_device.__triggers:
+                    if t == other_t and duration == other_duration:
+                        already_requested = True
+        if not already_requested:
+            self.trigger_device.trigger(t, duration)
+
+        # Check for triggers too close together (check for overlapping triggers already
+        # performed in Trigger.trigger()):
+        start = t
+        end = t + duration
+        for other_t, other_duration in self.__triggers:
+            other_start = other_t
+            other_end = other_t + other_duration
+            if (
+                abs(other_start - end) < self.minimum_recovery_time
+                or abs(other_end - start) < self.minimum_recovery_time
+            ):
+                msg = """%s %s has two triggers closer together than the minimum
+                    recovery time: one at t = %fs for %fs, and another at t = %fs for
+                    %fs. The minimum recovery time is %fs."""
+                msg = msg % (
+                    self.description,
+                    self.name,
+                    t,
+                    duration,
+                    start,
+                    duration,
+                    self.minimum_recovery_time,
+                )
+                raise ValueError(dedent(msg))
+
+        self.__triggers.append([t, duration])
+
+    def do_checks(self):
+        # Check that all devices sharing a trigger device have triggers when we have triggers:
+        for device in self.trigger_device.child_devices:
+            if device is not self:
+                for trigger in self.__triggers:
+                    if trigger not in device.__triggers:
+                        start, duration = trigger
+                        raise LabscriptError('TriggerableDevices %s and %s share a trigger. ' % (self.name, device.name) + 
+                                             '%s has a trigger at %fs for %fs, ' % (self.name, start, duration) +
+                                             'but there is no matching trigger for %s. ' % device.name +
+                                             'Devices sharing a trigger must have identical trigger times and durations.')
+
+    def generate_code(self, hdf5_file):
+        self.do_checks()
+        Device.generate_code(self, hdf5_file)
+
     
 class PseudoclockDevice(TriggerableDevice):
     description = 'Generic Pseudoclock Device'
@@ -989,7 +1053,7 @@ class PseudoclockDevice(TriggerableDevice):
                                      "Please instantiate a WaitMonitor in your connection table.")
             self.trigger_times.append(t)
         else:
-            self.trigger_device.trigger(t, duration)
+            TriggerableDevice.trigger(self, t, duration)
             self.trigger_times.append(round(t + wait_delay,10))
             
     def do_checks(self, outputs):
@@ -1810,14 +1874,14 @@ class WaitMonitor(Trigger):
         self.timeout_trigger_type = timeout_trigger_type
         
         
-class DDS(Device):
+class DDSQuantity(Device):
     description = 'DDS'
     allowed_children = [AnalogQuantity,DigitalOut,DigitalQuantity] # Adds its own children when initialised
 
     @set_passed_properties(property_names = {})
     def __init__(self, name, parent_device, connection, digital_gate={}, freq_limits=None, freq_conv_class=None, freq_conv_params={},
                  amp_limits=None, amp_conv_class=None, amp_conv_params={}, phase_limits=None, phase_conv_class=None, phase_conv_params = {},
-                 **kwargs):
+                 call_parents_add_device = True, **kwargs):
         #self.clock_type = parent_device.clock_type # Don't see that this is needed anymore
         
         # Here we set call_parents_add_device=False so that we
@@ -1861,7 +1925,11 @@ class DDS(Device):
         # check this and throw an error in its add_device method. See
         # labscript_devices.PulseBlaster.PulseBlaster.add_device for an
         # example of this.
-        self.parent_device.add_device(self)
+        # In some subclasses we need to hold off on calling the parent
+        # device's add_device function until further code has run,
+        # e.g., see PulseBlasterDDS in PulseBlaster.py
+        if call_parents_add_device:
+            self.parent_device.add_device(self)
         
     def setamp(self, t, value, units=None):
         self.amplitude.constant(t, value, units)
@@ -1896,6 +1964,8 @@ class DDS(Device):
             self.setamp(t + duration, 0)
         return duration
 
+class DDS(DDSQuantity):
+    pass
 
 class StaticDDS(Device):
     description = 'Static RF'
@@ -1965,7 +2035,7 @@ class LabscriptError(Exception):
 
 def save_time_markers(hdf5_file):
     time_markers = compiler.time_markers
-    dtypes = dtype_workaround([('label','a256'), ('time', float), ('color', '(1,3)uint8')])
+    dtypes = dtype_workaround([('label','a256'), ('time', float), ('color', '(1,3)int')])
     data_array = zeros(len(time_markers), dtype=dtypes)
     for i, t in enumerate(time_markers):
         data_array[i] = time_markers[t]["label"], t, time_markers[t]["color"]
@@ -2180,11 +2250,27 @@ def wait(label, t, timeout=5):
     compiler.wait_table[t] = str(label), float(timeout)
     return max_delay
 
-def add_time_marker(t, label, color=(0,0,0), verbose = False):
-    #color in rgb
+def add_time_marker(t, label, color=None, verbose=False):
+    """Add a marker for the specified time. These markers are saved in the HDF5 file.
+    This allows one to label that time with a string label, and a color that
+    applications may use to represent this part of the experiment. The color may be
+    specified as an RGB tuple, or a string of the color name such as 'red', or a string
+    of its hex value such as '#ff88g0'. If verbose=True, this funtion also prints the
+    label and time, which can be useful to view during shot compilation.
+
+    Runviewer displays these markers and allows one to manipulate the time axis based on
+    them, and BLACS' progress bar plugin displays the name and colour of the most recent
+    marker as the shot is running"""
+    if isinstance(color, (str, bytes)):
+        import PIL.ImageColor
+        color = PIL.ImageColor.getrgb(color)
+    if color is None:
+        color = (-1, -1, -1)
+    elif not all(0 <= n <= 255 for n in color):
+        raise ValueError("Invalid RGB tuple %s" % str(color))
     if verbose:
-        functions.print_time(t,label)
-    compiler.time_markers[t] = {"label":label, "color":color}
+        functions.print_time(t, label)
+    compiler.time_markers[t] = {"label": label, "color": color}
 
 def start():
     compiler.start_called = True
